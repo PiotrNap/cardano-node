@@ -34,17 +34,17 @@ import           Generic.Data (gmappend)
 import           Generic.Data.Orphans ()
 import           Options.Applicative
 import           System.FilePath (takeDirectory, (</>))
-import           System.Posix.Types (Fd (..))
 
 import qualified Cardano.Chain.Update as Byron
 import           Cardano.Crypto (RequiresNetworkMagic (..))
+import           Cardano.Node.Configuration.Socket (SocketConfig (..), PartialSocketConfig (..))
+import           Cardano.Node.Handlers.Shutdown
 import           Cardano.Node.Protocol.Types (Protocol (..))
 import           Cardano.Node.Types
 import           Cardano.Tracing.Config
 import           Ouroboros.Consensus.Mempool.API (MempoolCapacityBytes (..),
                    MempoolCapacityBytesOverride (..))
 import           Ouroboros.Consensus.Storage.LedgerDB.DiskPolicy (SnapshotInterval (..))
-import           Ouroboros.Network.Block (MaxSlotNo (..))
 import           Ouroboros.Network.NodeToNode (DiffusionMode (..), AcceptedConnectionsLimit (..))
 import qualified Ouroboros.Consensus.Node as Consensus ( NetworkP2PMode (..) )
 
@@ -72,10 +72,8 @@ instance Show SomeNetworkP2PMode where
 
 data NodeConfiguration
   = NodeConfiguration
-      {  ncNodeIPv4Addr    :: !(Maybe NodeHostIPv4Address)
-      ,  ncNodeIPv6Addr    :: !(Maybe NodeHostIPv6Address)
-      ,  ncNodePortNumber  :: !(Maybe PortNumber)
-          -- | Filepath of the configuration yaml file. This file determines
+      {  ncSocketConfig    :: !SocketConfig
+           -- | Filepath of the configuration yaml file. This file determines
           -- all the configuration settings required for the cardano node
           -- (logging, tracing, protocol, slot length etc)
        , ncConfigFile      :: !ConfigYamlFilePath
@@ -83,14 +81,12 @@ data NodeConfiguration
        , ncDatabaseFile    :: !DbFile
        , ncProtocolFiles   :: !ProtocolFilepaths
        , ncValidateDB      :: !Bool
-       , ncShutdownIPC     :: !(Maybe Fd)
-       , ncShutdownOnSlotSynced :: !MaxSlotNo
+       , ncShutdownConfig  :: !ShutdownConfig
 
         -- Protocol-specific parameters:
        , ncProtocolConfig :: !NodeProtocolConfiguration
 
          -- Node parameters, not protocol-specific:
-       , ncSocketPath       :: !(Maybe SocketPath)
        , ncDiffusionMode    :: !DiffusionMode
        , ncSnapshotInterval :: !SnapshotInterval
 
@@ -144,9 +140,7 @@ data NodeConfiguration
 
 data PartialNodeConfiguration
   = PartialNodeConfiguration
-      {  pncNodeIPv4Addr    :: !(Last NodeHostIPv4Address)
-      ,  pncNodeIPv6Addr    :: !(Last NodeHostIPv6Address)
-      ,  pncNodePortNumber  :: !(Last PortNumber)
+      {  pncSocketConfig    :: !PartialSocketConfig
          -- | Filepath of the configuration yaml file. This file determines
          -- all the configuration settings required for the cardano node
          -- (logging, tracing, protocol, slot length etc)
@@ -155,14 +149,12 @@ data PartialNodeConfiguration
        , pncDatabaseFile    :: !(Last DbFile)
        , pncProtocolFiles   :: !(Last ProtocolFilepaths)
        , pncValidateDB      :: !(Last Bool)
-       , pncShutdownIPC     :: !(Last Fd)
-       , pncShutdownOnSlotSynced :: !(Last MaxSlotNo)
+       , pncShutdownConfig  :: !PartialShutdownConfig
 
          -- Protocol-specific parameters:
        , pncProtocolConfig :: !(Last NodeProtocolConfiguration)
 
          -- Node parameters, not protocol-specific:
-       , pncSocketPath       :: !(Last SocketPath)
        , pncDiffusionMode    :: !(Last DiffusionMode)
        , pncSnapshotInterval :: !(Last SnapshotInterval)
        , pncTestEnableDevelopmentNetworkProtocols :: !(Last Bool)
@@ -199,7 +191,7 @@ data PartialNodeConfiguration
 instance AdjustFilePaths PartialNodeConfiguration where
   adjustFilePaths f x =
     x { pncProtocolConfig = adjustFilePaths f (pncProtocolConfig x)
-      , pncSocketPath     = adjustFilePaths f (pncSocketPath x)
+      , pncSocketConfig   = adjustFilePaths f (pncSocketConfig x)
       }
 
 instance Semigroup PartialNodeConfiguration where
@@ -223,9 +215,16 @@ instance FromJSON PartialNodeConfiguration where
       pncMaxConcurrencyDeadline <- Last <$> v .:? "MaxConcurrencyDeadline"
 
       -- Logging parameters
-      pncLoggingSwitch <- Last . Just <$> v .:? "TurnOnLogging" .!= True
-      pncLogMetrics    <- Last        <$> v .:? "TurnOnLogMetrics"
-      pncTraceConfig   <- Last . Just <$> traceConfigParser v
+      pncLoggingSwitch'  <-                 v .:? "TurnOnLogging" .!= True
+      pncLogMetrics      <- Last        <$> v .:? "TurnOnLogMetrics"
+      useTraceDispatcher <-                 v .:? "UseTraceDispatcher" .!= False
+      pncTraceConfig     <- Last . Just <$> if pncLoggingSwitch'
+                                            then
+                                                 traceConfigParser v
+                                                 (if useTraceDispatcher
+                                                  then TraceDispatcher
+                                                  else TracingOn)
+                                            else pure TracingOff
 
       -- Protocol parameters
       protocol <-  v .:? "Protocol" .!= ByronProtocol
@@ -269,25 +268,21 @@ instance FromJSON PartialNodeConfiguration where
 
       pure PartialNodeConfiguration {
              pncProtocolConfig
-           , pncSocketPath
+           , pncSocketConfig = PartialSocketConfig pncSocketPath mempty mempty mempty
            , pncDiffusionMode
            , pncSnapshotInterval
            , pncTestEnableDevelopmentNetworkProtocols
            , pncMaxConcurrencyBulkSync
            , pncMaxConcurrencyDeadline
-           , pncLoggingSwitch
+           , pncLoggingSwitch = Last $ Just pncLoggingSwitch'
            , pncLogMetrics
            , pncTraceConfig
-           , pncNodeIPv4Addr = mempty
-           , pncNodeIPv6Addr = mempty
-           , pncNodePortNumber = mempty
            , pncConfigFile = mempty
            , pncTopologyFile = mempty
            , pncDatabaseFile = mempty
            , pncProtocolFiles = mempty
            , pncValidateDB = mempty
-           , pncShutdownIPC = mempty
-           , pncShutdownOnSlotSynced = mempty
+           , pncShutdownConfig = PartialShutdownConfig mempty mempty
            , pncMaybeMempoolCapacityOverride
            , pncProtocolIdleTimeout
            , pncTimeWaitTimeout
@@ -413,18 +408,14 @@ defaultPartialNodeConfiguration =
     { pncConfigFile = Last . Just $ ConfigYamlFilePath "configuration/cardano/mainnet-config.json"
     , pncDatabaseFile = Last . Just $ DbFile "mainnet/db/"
     , pncLoggingSwitch = Last $ Just True
-    , pncSocketPath = mempty
+    , pncSocketConfig = PartialSocketConfig mempty mempty mempty mempty
     , pncDiffusionMode = Last $ Just InitiatorAndResponderDiffusionMode
     , pncSnapshotInterval = Last $ Just DefaultSnapshotInterval
     , pncTestEnableDevelopmentNetworkProtocols = Last $ Just False
     , pncTopologyFile = Last . Just $ TopologyFile "configuration/cardano/mainnet-topology.json"
-    , pncNodeIPv4Addr = mempty
-    , pncNodeIPv6Addr = mempty
-    , pncNodePortNumber = mempty
     , pncProtocolFiles = mempty
     , pncValidateDB = mempty
-    , pncShutdownIPC = mempty
-    , pncShutdownOnSlotSynced = mempty
+    , pncShutdownConfig = PartialShutdownConfig mempty mempty
     , pncProtocolConfig = mempty
     , pncMaxConcurrencyBulkSync = mempty
     , pncMaxConcurrencyDeadline = mempty
@@ -461,13 +452,13 @@ makeNodeConfiguration pnc = do
   databaseFile <- lastToEither "Missing DatabaseFile" $ pncDatabaseFile pnc
   protocolFiles <- lastToEither "Missing ProtocolFiles" $ pncProtocolFiles pnc
   validateDB <- lastToEither "Missing ValidateDB" $ pncValidateDB pnc
-  shutdownOnSlotSynced <- lastToEither "Missing ShutdownOnSlotSynced" $ pncShutdownOnSlotSynced pnc
   protocolConfig <- lastToEither "Missing ProtocolConfig" $ pncProtocolConfig pnc
   loggingSwitch <- lastToEither "Missing LoggingSwitch" $ pncLoggingSwitch pnc
   logMetrics <- lastToEither "Missing LogMetrics" $ pncLogMetrics pnc
   traceConfig <- lastToEither "Missing TraceConfig" $ pncTraceConfig pnc
   diffusionMode <- lastToEither "Missing DiffusionMode" $ pncDiffusionMode pnc
   snapshotInterval <- lastToEither "Missing SnapshotInterval" $ pncSnapshotInterval pnc
+  shutdownConfig <- makeShutdownConfig $ pncShutdownConfig pnc
 
   ncTargetNumberOfRootPeers <-
     lastToEither "Missing TargetNumberOfRootPeers"
@@ -498,18 +489,14 @@ makeNodeConfiguration pnc = do
     lastToEither "Missing TestEnableDevelopmentNetworkProtocols" $
       pncTestEnableDevelopmentNetworkProtocols pnc
   return $ NodeConfiguration
-             { ncNodeIPv4Addr = getLast $ pncNodeIPv4Addr pnc
-             , ncNodeIPv6Addr = getLast $ pncNodeIPv6Addr pnc
-             , ncNodePortNumber = getLast $ pncNodePortNumber pnc
-             , ncConfigFile = configFile
+             { ncConfigFile = configFile
              , ncTopologyFile = topologyFile
              , ncDatabaseFile = databaseFile
              , ncProtocolFiles = protocolFiles
              , ncValidateDB = validateDB
-             , ncShutdownIPC = getLast $ pncShutdownIPC pnc
-             , ncShutdownOnSlotSynced = shutdownOnSlotSynced
+             , ncShutdownConfig = shutdownConfig
              , ncProtocolConfig = protocolConfig
-             , ncSocketPath = getLast $ pncSocketPath pnc
+             , ncSocketConfig = makeSocketConfig (pncSocketConfig pnc)
              , ncDiffusionMode = diffusionMode
              , ncSnapshotInterval = snapshotInterval
              , ncTestEnableDevelopmentNetworkProtocols = testEnableDevelopmentNetworkProtocols
@@ -531,6 +518,20 @@ makeNodeConfiguration pnc = do
                  EnabledP2PMode  -> SomeNetworkP2PMode Consensus.EnabledP2PMode
                  DisabledP2PMode -> SomeNetworkP2PMode Consensus.DisabledP2PMode
              }
+ where
+   makeShutdownConfig :: PartialShutdownConfig -> Either String ShutdownConfig
+   makeShutdownConfig psc =
+     case getLast (pscOnSlotSynced psc) of
+       Nothing -> Left "Missing Shutdown Config OnSlotSynced"
+       Just x  -> Right $ ShutdownConfig (getLast (pscIPC psc)) x
+
+   makeSocketConfig :: PartialSocketConfig -> SocketConfig
+   makeSocketConfig psc =
+     SocketConfig
+       (getLast $ pncNodeIPv4Addr psc)
+       (getLast $ pncNodeIPv6Addr psc)
+       (getLast $ pncNodePortNumber psc)
+       (getLast $ pncSocketPath psc)
 
 ncProtocol :: NodeConfiguration -> Protocol
 ncProtocol nc =
