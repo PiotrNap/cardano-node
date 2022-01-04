@@ -904,7 +904,7 @@ runQueryLeadershipSchedule (AnyConsensusModeParams cModeParams) network
       schedule :: Set SlotNo
         <- firstExceptT ShelleyQueryCmdLeaderShipError $ hoistEither
              $ eligibleLeaderSlotsConstaints sbe
-             $ eligibleLeadershipSlots sbe shelleyGenesis eInfo
+             $ currentEpochEligibleLeadershipSlots sbe shelleyGenesis eInfo
                                        pparams serDebugLedState ptclState poolid vrkSkey
       liftIO $ printLeadershipSchedule schedule eInfo (SystemStart $ sgSystemStart shelleyGenesis)
     mode -> left . ShelleyQueryCmdUnsupportedMode $ AnyConsensusMode mode

@@ -44,7 +44,7 @@ module Cardano.Api.LedgerState
   -- * Leadership schedule
   , LeadershipError(..)
   , constructGlobals
-  , eligibleLeadershipSlots
+  , currentEpochEligibleLeadershipSlots
   )
   where
 
@@ -63,11 +63,15 @@ import           Data.ByteString as BS
 import qualified Data.ByteString.Base16 as Base16
 import           Data.ByteString.Short as BSS
 import           Data.Foldable
+import           Data.Functor.Identity (Identity)
 import           Data.IORef
+import qualified Data.Map as Map
+import           Data.Maybe (mapMaybe)
 import           Data.SOP.Strict (NP (..))
 import           Data.Sequence (Seq)
 import qualified Data.Sequence as Seq
 import           Data.Set (Set)
+import qualified Data.Set as Set
 import           Data.Text (Text)
 import qualified Data.Text as Text
 import qualified Data.Text.Encoding as Text
@@ -80,6 +84,7 @@ import           Cardano.Api.Block
 import           Cardano.Api.Certificate
 import           Cardano.Api.Eras
 import           Cardano.Api.Error
+import           Cardano.Api.GenesisParameters
 import           Cardano.Api.IPC (ConsensusModeParams (..),
                    LocalChainSyncClient (LocalChainSyncClientPipelined),
                    LocalNodeClientProtocols (..), LocalNodeClientProtocolsInMode,
@@ -90,7 +95,7 @@ import           Cardano.Api.LedgerEvent (LedgerEvent, toLedgerEvent)
 import           Cardano.Api.Modes (CardanoMode, EpochSlots (..))
 import           Cardano.Api.NetworkId (NetworkId (..), NetworkMagic (NetworkMagic))
 import           Cardano.Api.ProtocolParameters
-import           Cardano.Api.Query (DebugLedgerState (..), ProtocolState,
+import           Cardano.Api.Query (CurrentEpochState (..), DebugLedgerState (..), ProtocolState,
                    SerialisedDebugLedgerState, decodeDebugLedgerState, decodeProtocolState)
 import           Cardano.Binary (FromCBOR)
 import qualified Cardano.Chain.Genesis
@@ -102,6 +107,7 @@ import qualified Cardano.Crypto.Hashing
 import qualified Cardano.Crypto.ProtocolMagic
 import qualified Cardano.Crypto.VRF as Crypto
 import           Cardano.Ledger.Alonzo.Genesis (AlonzoGenesis (..))
+import qualified Cardano.Ledger.BHeaderView as Ledger
 import           Cardano.Ledger.BaseTypes (Globals (..), UnitInterval)
 import qualified Cardano.Ledger.BaseTypes as Shelley.Spec
 import qualified Cardano.Ledger.Core as Core
@@ -109,12 +115,20 @@ import qualified Cardano.Ledger.Credential as Shelley.Spec
 import qualified Cardano.Ledger.Crypto as Crypto
 import qualified Cardano.Ledger.Era as Ledger
 import qualified Cardano.Ledger.Keys as Shelley.Spec
+import qualified Cardano.Ledger.PoolDistr as Shelley
 import qualified Cardano.Ledger.Shelley.API.Protocol as TPraos
+import qualified Cardano.Ledger.Shelley.EpochBoundary as Shelley
 import qualified Cardano.Ledger.Shelley.Genesis as Shelley.Spec
-import           Cardano.Slotting.EpochInfo (EpochInfo)
+import qualified Cardano.Ledger.Shelley.LedgerState as ShelleyLS
+import qualified Cardano.Ledger.Shelley.Rules.NewEpoch as Shelley
+import qualified Cardano.Ledger.Shelley.Rules.Rupd as Shelley
+import qualified Cardano.Protocol.TPraos.BHeader as Ledger
+import qualified Cardano.Protocol.TPraos.BHeader as TPraos
+import qualified Cardano.Protocol.TPraos.Rules.Tickn as TPraos
+import           Cardano.Slotting.EpochInfo (EpochInfo, fixedEpochInfo)
 import           Cardano.Slotting.Slot (WithOrigin (At, Origin))
 import qualified Cardano.Slotting.Slot as Slot
-import           Data.Maybe (mapMaybe)
+import           Cardano.Slotting.Time (mkSlotLength)
 import           Network.TypedProtocol.Pipelined (Nat (..))
 import qualified Ouroboros.Consensus.Block.Abstract as Consensus
 import qualified Ouroboros.Consensus.Byron.Ledger.Block as Byron
@@ -1240,6 +1254,13 @@ unChainHash ch =
 
 data LeadershipError = LeaderErrDecodeLedgerStateFailure
                      | LeaderErrDecodeProtocolStateFailure
+                     | LeaderErrGenesisSlot
+                     | LeaderErrStakePoolHasNoStake PoolId
+                     | LeaderErrStakeDistribUnstable
+                         SlotNo
+                         -- ^ Current slot
+                         SlotNo
+                         -- ^ Slot from which the stake distribution is stable
                      deriving Show
 
 instance Error LeadershipError where
@@ -1247,10 +1268,116 @@ instance Error LeadershipError where
     "Failed to successfully decode ledger state"
   displayError LeaderErrDecodeProtocolStateFailure =
     "Failed to successfully decode protocol state"
+  displayError LeaderErrGenesisSlot =
+    "Leadership schedule currently cannot be calculated from genesis"
+  displayError (LeaderErrStakePoolHasNoStake _) = ""
+  displayError (LeaderErrStakeDistribUnstable _ _) = ""
+
+nextEpochEligibleLeadershipSlots
+  :: HasField "_d" (Core.PParams (ShelleyLedgerEra era)) UnitInterval
+  => Ledger.Crypto (ShelleyLedgerEra era) ~ Shelley.StandardCrypto
+  => ShelleyBasedEra era
+  -> Globals
+  -> CurrentEpochState era
+  -- ^ We need the mark stake distribution in order to predict
+  --   the following epoch's leadership schedule
+  -> ProtocolState era
+  -> PoolId
+  -- ^ Potential slot leading stake pool
+  -> SigningKey VrfKey
+  -- ^ VRF signing key of the stake pool
+  -> ProtocolParameters
+  -> GenesisParameters
+  -> (ChainTip, EpochNo)
+  -> Either LeadershipError (Set SlotNo)
+nextEpochEligibleLeadershipSlots sbe globals (CurrentEpochState cEstate) ptclState
+                 poolid@(StakePoolKeyHash poolHash) (VrfSigningKey vrfSkey) pParams
+                 gParams (cTip, currentEpoch) = do
+  -- First we check if we are within 3k/f slots of the end of the current epoch
+  -- k is the security parameter
+  -- f is the active slot coefficient
+  let stabilityWindowR = fromIntegral (3 * protocolParamSecurity gParams) / protocolParamActiveSlotsCoefficient gParams
+      stabilityWindowW64 = fromIntegral @Word64 $ floor $ fromRational @Double stabilityWindowR
+      stableStakeDistribSlot = lastSlot - stabilityWindowW64
+
+  case cTip of
+    ChainTipAtGenesis -> Left LeaderErrGenesisSlot
+    ChainTip tip _ _ ->
+      if tip > stableStakeDistribSlot
+      then return ()
+      else Left $ LeaderErrStakeDistribUnstable tip stableStakeDistribSlot
+
+  -- Then we get the "mark" snapshot. This snapshot will be used for the next
+  -- epoch's leadership schedule.
+  let markSnapshotPoolDistr = Shelley.unPoolDistr . Shelley.calculatePoolDistr . Shelley._pstakeMark
+                                $ ShelleyLS.esSnapshots cEstate
+
+  relativeStake <- maybe (Left $ LeaderErrStakePoolHasNoStake poolid)
+                         (Right . Shelley.individualPoolStake) $ Map.lookup poolHash markSnapshotPoolDistr
+
+
+  let isLeader :: Consensus.Nonce -> SlotNo -> Bool
+      isLeader eNonce slotNo = isSlotLeader sbe eNonce firstSlot pp vrfSkey relativeStake f slotNo
+
+  chainDepState <- first (const LeaderErrDecodeProtocolStateFailure)
+                     $ decodeProtocolState ptclState
+
+  let TPraos.TicknState epochNonce _ = TPraos.csTickn chainDepState
+
+  return $ Set.filter (isLeader epochNonce) epochSlotRange
+ where
+  -- This allows us to calculate the slot range of the next epoch
+  epochInfoConstant :: EpochInfo Identity
+  epochInfoConstant = fixedEpochInfo (protocolParamEpochLength gParams)
+                                       (mkSlotLength $ protocolParamSlotLength gParams)
+
+  pp = toLedgerPParams sbe pParams
+
+  f :: Shelley.Spec.ActiveSlotCoeff
+  f = activeSlotCoeff globals
+
+  epochSlotRange :: Set SlotNo
+  epochSlotRange = Set.fromList [firstSlot .. lastSlot]
+
+  -- First and last slots of the following epoch
+  (firstSlot, lastSlot) = Shelley.runIdentity
+                            $ Shelley.epochInfoRange epochInfoConstant (currentEpoch + 1)
+
+-- | Check if a stake pool is a slot leader for a particular slot
+isSlotLeader
+  ::  Crypto.Signable v Shelley.Spec.Seed
+  => Crypto.VRFAlgorithm v
+  => Crypto.ContextVRF v ~ ()
+  => HasField "_d" (Core.PParams (ShelleyLedgerEra era)) UnitInterval
+  => ShelleyBasedEra era
+  -> Consensus.Nonce
+  -> SlotNo
+  -> Core.PParams (ShelleyLedgerEra era)
+  -> Crypto.SignKeyVRF v
+  -> Rational -- ^ Stake pool relative stake
+  -> Shelley.Spec.ActiveSlotCoeff
+  -> SlotNo -- ^ Potential leadership slot for the stake pool.
+  -> Bool
+isSlotLeader _ eNonce epochStartSlot pParams
+             vrfSkey stakePoolStake activeSlotCoeff' slotNo =
+  let certified = Crypto.evalCertified () (Ledger.mkSeed TPraos.seedL slotNo eNonce) vrfSkey
+  in not (Ledger.isOverlaySlot epochStartSlot (getField @"_d" pParams) slotNo)
+       && TPraos.checkLeaderValue (Crypto.certifiedOutput certified)
+                                  stakePoolStake activeSlotCoeff'
+
+-- | Because we are getting the previous NewEpochState
+-- mark is for our current epoch
+getCurrentAndNextStakeDistributions
+  :: CurrentEpochState era
+  -> ( Shelley.PoolDistr (ShelleyLedgerEra era) -- "Mark" or current epoch's stake distribution.
+     , Shelley.PoolDistr (ShelleyLedgerEra era) -- "Set" or the following epoch's stake distribution.
+     )
+getCurrentAndNextStakeDistributions (CurrentEpochState newEpochState) = error ""
+
 
 -- | Return the slots at which a particular stake pool operator is
 -- expected to mint a block.
-eligibleLeadershipSlots
+currentEpochEligibleLeadershipSlots
   :: FromCBOR (DebugLedgerState era)
   => ShelleyLedgerEra era ~ ledgerera
   => Ledger.Era ledgerera
@@ -1266,7 +1393,7 @@ eligibleLeadershipSlots
   -> PoolId
   -> SigningKey VrfKey
   -> Either LeadershipError (Set SlotNo)
-eligibleLeadershipSlots sbe sGen eInfo pParams serDebugLegState ptclState
+currentEpochEligibleLeadershipSlots sbe sGen eInfo pParams serDebugLegState ptclState
                         (StakePoolKeyHash poolid) (VrfSigningKey vrkSkey) = do
   DebugLedgerState newEpochState
     <- first (const LeaderErrDecodeLedgerStateFailure)
